@@ -8,16 +8,38 @@ import yt_dlp
 app = Flask(__name__)
 
 UPDATE_SECRET_KEY = "mysecret123"
+COOKIE_PATH = "/tmp/yt_cookies.txt"
+
+# Smart Cookie Loader: Detects cookies from Environment Variables or Secret Files
+def ensure_cookie_file():
+    cookie_content = os.environ.get('YOUTUBE_COOKIES')
+    if not cookie_content:
+        # Fallback in case variable name was slightly different
+        for k, v in os.environ.items():
+            if 'cookie' in k.lower() or '# Netscape' in v or '__Secure' in v:
+                cookie_content = v
+                break
+    
+    if cookie_content and len(cookie_content.strip()) > 30:
+        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+            f.write(cookie_content.strip() + "\n")
+        return COOKIE_PATH
+    
+    if os.path.exists(COOKIE_PATH):
+        return COOKIE_PATH
+    return None
 
 @app.route('/')
 def home():
+    cookie_file = ensure_cookie_file()
     return jsonify({
         "status": "online",
         "service": "Personal yt-dlp API",
-        "engine_version": yt_dlp.version.__version__
+        "engine_version": yt_dlp.version.__version__,
+        "cookies_loaded": bool(cookie_file)
     })
 
-# 1. Media Info Endpoint (Using Native Android Client - No Cookies Needed)
+# 1. Media Info Endpoint with Cookies & Accurate File Size
 @app.route('/info', methods=['GET'])
 def get_info():
     video_url = request.args.get('url')
@@ -26,25 +48,24 @@ def get_info():
     if not video_url:
         return jsonify({"success": False, "error": "Missing URL parameter"}), 400
 
-    # Spoof Android App - Bypasses Datacenter IP block without login/cookies
+    cookie_file = ensure_cookie_file()
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android']
-            }
-        }
     }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             formats = info.get('formats', [])
 
-            # Filter out storyboard, preview images, and mhtml
+            # Filter out preview/storyboard images and invalid links
             media_formats = [
                 f for f in formats 
                 if f.get('url') 
@@ -53,13 +74,13 @@ def get_info():
             ]
 
             if not media_formats:
-                return jsonify({"success": False, "error": "No media streams found"}), 404
+                return jsonify({"success": False, "error": "No playable media streams found."}), 404
 
             chosen = None
             ext = "mp4"
 
             if req_format == 'mp3':
-                # Pick audio-only stream with highest bitrate
+                # Select best audio stream
                 audio_streams = [
                     f for f in media_formats 
                     if f.get('acodec') != 'none' and f.get('vcodec') == 'none'
@@ -70,7 +91,7 @@ def get_info():
                 chosen = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
                 ext = "m4a"
             else:
-                # First priority: Progressive stream (Video + Audio combined in MP4)
+                # Prioritize progressive video (video + audio combined)
                 progressive = [
                     f for f in media_formats 
                     if f.get('vcodec') != 'none' and f.get('acodec') != 'none'
@@ -78,19 +99,18 @@ def get_info():
                 if progressive:
                     chosen = max(progressive, key=lambda f: f.get('height') or 0)
                 else:
-                    # Fallback to any valid video stream
-                    video_only = [f for f in media_formats if f.get('vcodec') != 'none']
-                    chosen = max(video_only, key=lambda f: f.get('height') or f.get('tbr') or 0) if video_only else media_formats[-1]
+                    video_streams = [f for f in media_formats if f.get('vcodec') != 'none']
+                    chosen = max(video_streams, key=lambda f: f.get('height') or f.get('tbr') or 0) if video_streams else media_formats[-1]
                 
                 ext = chosen.get('ext', 'mp4')
 
             if not chosen or not chosen.get('url'):
                 return jsonify({"success": False, "error": "Playable stream link unavailable"}), 404
 
-            # Exact file size calculation
+            # Accurate filesize calculation
             filesize = chosen.get('filesize') or chosen.get('filesize_approx') or 0
             duration = info.get('duration', 0)
-            
+
             if filesize == 0 and duration:
                 tbr = chosen.get('tbr') or chosen.get('abr') or chosen.get('vbr') or 0
                 if tbr:
@@ -110,7 +130,7 @@ def get_info():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-# 2. Proxy Streamer with Header Passthrough
+# 2. Proxy Streamer with Range Support (For Android DownloadManager)
 @app.route('/stream', methods=['GET'])
 def stream_media():
     target_stream_url = request.args.get('url')
@@ -118,24 +138,31 @@ def stream_media():
         return "Missing stream URL", 400
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
+
+    # Forward Range header from Android DownloadManager
+    range_header = request.headers.get('Range')
+    if range_header:
+        headers['Range'] = range_header
+
     try:
-        req = requests.get(target_stream_url, headers=headers, stream=True, timeout=25)
-        total_length = req.headers.get('content-length')
+        req = requests.get(target_stream_url, headers=headers, stream=True, timeout=30)
         response_headers = {
-            'Content-Type': req.headers.get('content-type', 'application/octet-stream')
+            'Content-Type': req.headers.get('content-type', 'application/octet-stream'),
+            'Accept-Ranges': 'bytes'
         }
-        if total_length:
-            response_headers['Content-Length'] = total_length
+        if req.headers.get('content-length'):
+            response_headers['Content-Length'] = req.headers.get('content-length')
+        if req.headers.get('content-range'):
+            response_headers['Content-Range'] = req.headers.get('content-range')
 
         def generate():
             for chunk in req.iter_content(chunk_size=1024 * 64):
                 if chunk:
                     yield chunk
 
-        return Response(stream_with_context(generate()), headers=response_headers)
+        return Response(stream_with_context(generate()), status=req.status_code, headers=response_headers)
     except Exception as e:
         return f"Stream failed: {str(e)}", 500
 
