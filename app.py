@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+import tempfile
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 import yt_dlp
@@ -17,7 +18,7 @@ def home():
         "engine_version": yt_dlp.version.__version__
     })
 
-# 1. Media Info & Dynamic Format Resolver
+# 1. Media Info Endpoint with VR/TV Bypass
 @app.route('/info', methods=['GET'])
 def get_info():
     video_url = request.args.get('url')
@@ -26,65 +27,82 @@ def get_info():
     if not video_url:
         return jsonify({"success": False, "error": "Missing URL parameter"}), 400
 
-    # No strict format lock here - allows yt-dlp to safely fetch all available streams
+    # Cookie support via Render Environment Variable (if added in the future)
+    cookie_file = None
+    cookies_env = os.environ.get('YOUTUBE_COOKIES')
+    if cookies_env:
+        try:
+            temp_cookie = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+            temp_cookie.write(cookies_env)
+            temp_cookie.close()
+            cookie_file = temp_cookie.name
+        except Exception:
+            pass
+
+    # Android VR & TV clients completely bypass datacenter IP restrictions
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'nocheckcertificate': True,
+        'format': 'all',  # Accepts all streams without throwing format selector exceptions
         'extractor_args': {
             'youtube': {
-                'player_client': ['web', 'mweb', 'ios']
+                'player_client': ['android_vr', 'tv_embedded', 'tv', 'web_embedded']
             }
         }
     }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             formats = info.get('formats', [])
-            
+
+            if not formats:
+                return jsonify({
+                    "success": False, 
+                    "error": "No streams found. YouTube blocked this specific request."
+                }), 404
+
             chosen_format = None
             ext = "mp4"
 
             if req_format == 'mp3':
-                # Filter for audio-only streams
+                # Filter for direct audio streams
                 audio_streams = [
                     f for f in formats 
                     if f.get('url') and f.get('acodec') != 'none' and f.get('vcodec') == 'none'
                 ]
                 if not audio_streams:
-                    # Fallback to any stream with audio
                     audio_streams = [f for f in formats if f.get('url') and f.get('acodec') != 'none']
                 
                 if audio_streams:
-                    # Pick highest bitrate audio
                     chosen_format = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
                 ext = "m4a"
             else:
-                # Filter for progressive streams (Both Video + Audio combined)
+                # Filter for combined streams (Both Video + Audio)
                 progressive_streams = [
                     f for f in formats 
                     if f.get('url') and f.get('vcodec') != 'none' and f.get('acodec') != 'none'
                 ]
                 if progressive_streams:
-                    # Pick highest resolution (720p if available, else 360p)
                     chosen_format = max(progressive_streams, key=lambda f: f.get('height') or 0)
                 else:
-                    # Fallback to best available single stream with direct URL
-                    valid_streams = [f for f in formats if f.get('url')]
-                    if valid_streams:
-                        chosen_format = max(valid_streams, key=lambda f: f.get('height') or f.get('tbr') or 0)
+                    # Fallback to the highest quality video stream
+                    valid_streams = [f for f in formats if f.get('url') and f.get('vcodec') != 'none']
+                    chosen_format = max(valid_streams, key=lambda f: f.get('height') or f.get('tbr') or 0) if valid_streams else formats[-1]
                 ext = chosen_format.get('ext', 'mp4') if chosen_format else "mp4"
 
             if not chosen_format or not chosen_format.get('url'):
-                return jsonify({"success": False, "error": "No playable direct stream found for this video"}), 404
+                return jsonify({"success": False, "error": "No playable direct stream found."}), 404
 
-            # Calculate accurate file size
+            # Exact file size calculation
             filesize = chosen_format.get('filesize') or chosen_format.get('filesize_approx') or 0
             duration = info.get('duration', 0)
             
-            # Smart bitrate fallback if filesize header is missing
             if filesize == 0 and duration:
                 tbr = chosen_format.get('tbr') or chosen_format.get('abr') or chosen_format.get('vbr') or 0
                 if tbr:
@@ -103,8 +121,14 @@ def get_info():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                os.remove(cookie_file)
+            except Exception:
+                pass
 
-# 2. Proxy Streamer with Direct Header Passthrough
+# 2. Proxy Streamer with Header Passthrough
 @app.route('/stream', methods=['GET'])
 def stream_media():
     target_stream_url = request.args.get('url')
