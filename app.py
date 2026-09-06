@@ -7,7 +7,6 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# Secret key for updating engine
 UPDATE_SECRET_KEY = "mysecret123"
 
 @app.route('/')
@@ -18,7 +17,7 @@ def home():
         "engine_version": yt_dlp.version.__version__
     })
 
-# 1. Media Info & Exact Size Endpoint
+# 1. Media Info & Dynamic Format Resolver
 @app.route('/info', methods=['GET'])
 def get_info():
     video_url = request.args.get('url')
@@ -27,7 +26,7 @@ def get_info():
     if not video_url:
         return jsonify({"success": False, "error": "Missing URL parameter"}), 400
 
-    # YouTube Bot-Block Bypass Configuration
+    # No strict format lock here - allows yt-dlp to safely fetch all available streams
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -35,46 +34,77 @@ def get_info():
         'nocheckcertificate': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web']
+                'player_client': ['web', 'mweb', 'ios']
             }
         }
     }
 
-    if req_format == 'mp3':
-        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
-    else:
-        # Ensures video and audio are combined in a single stream without requiring local ffmpeg merge
-        ydl_opts['format'] = 'best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best'
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
+            formats = info.get('formats', [])
             
-            # File size calculation
-            filesize = info.get('filesize') or info.get('filesize_approx') or 0
-            
-            # Fallback estimation if filesize is missing from headers
-            if filesize == 0 and info.get('duration') and info.get('tbr'):
-                # (bitrate in kbps * duration in seconds * 1024) / 8
-                filesize = int((info['tbr'] * info['duration'] * 1024) / 8)
+            chosen_format = None
+            ext = "mp4"
 
-            stream_url = info.get('url')
-            if not stream_url and 'formats' in info and len(info['formats']) > 0:
-                stream_url = info['formats'][-1].get('url')
+            if req_format == 'mp3':
+                # Filter for audio-only streams
+                audio_streams = [
+                    f for f in formats 
+                    if f.get('url') and f.get('acodec') != 'none' and f.get('vcodec') == 'none'
+                ]
+                if not audio_streams:
+                    # Fallback to any stream with audio
+                    audio_streams = [f for f in formats if f.get('url') and f.get('acodec') != 'none']
+                
+                if audio_streams:
+                    # Pick highest bitrate audio
+                    chosen_format = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
+                ext = "m4a"
+            else:
+                # Filter for progressive streams (Both Video + Audio combined)
+                progressive_streams = [
+                    f for f in formats 
+                    if f.get('url') and f.get('vcodec') != 'none' and f.get('acodec') != 'none'
+                ]
+                if progressive_streams:
+                    # Pick highest resolution (720p if available, else 360p)
+                    chosen_format = max(progressive_streams, key=lambda f: f.get('height') or 0)
+                else:
+                    # Fallback to best available single stream with direct URL
+                    valid_streams = [f for f in formats if f.get('url')]
+                    if valid_streams:
+                        chosen_format = max(valid_streams, key=lambda f: f.get('height') or f.get('tbr') or 0)
+                ext = chosen_format.get('ext', 'mp4') if chosen_format else "mp4"
+
+            if not chosen_format or not chosen_format.get('url'):
+                return jsonify({"success": False, "error": "No playable direct stream found for this video"}), 404
+
+            # Calculate accurate file size
+            filesize = chosen_format.get('filesize') or chosen_format.get('filesize_approx') or 0
+            duration = info.get('duration', 0)
+            
+            # Smart bitrate fallback if filesize header is missing
+            if filesize == 0 and duration:
+                tbr = chosen_format.get('tbr') or chosen_format.get('abr') or chosen_format.get('vbr') or 0
+                if tbr:
+                    filesize = int((tbr * 1024 * duration) / 8)
 
             return jsonify({
                 "success": True,
                 "title": info.get('title', 'YouTube Media'),
-                "duration": info.get('duration', 0),
+                "duration": duration,
                 "filesize_bytes": filesize,
                 "filesize_mb": round(filesize / (1024 * 1024), 2) if filesize > 0 else 0,
-                "stream_url": stream_url,
-                "ext": "mp3" if req_format == 'mp3' else "mp4"
+                "stream_url": chosen_format.get('url'),
+                "resolution": f"{chosen_format.get('height')}p" if chosen_format.get('height') else "Audio",
+                "ext": ext
             })
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-# 2. Proxy Streamer (Forwards Content-Length to Android)
+# 2. Proxy Streamer with Direct Header Passthrough
 @app.route('/stream', methods=['GET'])
 def stream_media():
     target_stream_url = request.args.get('url')
@@ -82,11 +112,11 @@ def stream_media():
         return "Missing stream URL", 400
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
     try:
-        req = requests.get(target_stream_url, headers=headers, stream=True, timeout=20)
+        req = requests.get(target_stream_url, headers=headers, stream=True, timeout=25)
         total_length = req.headers.get('content-length')
         response_headers = {
             'Content-Type': req.headers.get('content-type', 'application/octet-stream')
@@ -103,7 +133,7 @@ def stream_media():
     except Exception as e:
         return f"Stream failed: {str(e)}", 500
 
-# 3. In-App yt-dlp Update Endpoint
+# 3. Engine Update
 @app.route('/update', methods=['GET'])
 def update_engine():
     key = request.args.get('key')
