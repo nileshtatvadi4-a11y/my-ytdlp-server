@@ -38,7 +38,7 @@ def home():
         "cookies_loaded": bool(cookie_file)
     })
 
-# 1. Bulletproof Info Endpoint (No Format-Selector Crash)
+# 1. Direct Media Info Endpoint
 @app.route('/info', methods=['GET'])
 def get_info():
     raw_url = request.args.get('url', '')
@@ -51,13 +51,12 @@ def get_info():
     clean_video_url = url_match.group(0).strip()
     cookie_file = ensure_cookie_file()
 
-    # We tell yt-dlp: DO NOT filter formats, just give us all available streams!
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'nocheckcertificate': True,
-        'format': 'all',  # Prevents 'Requested format is not available'
+        'format': 'all',
         'ignore_no_formats_error': True,
     }
 
@@ -66,36 +65,33 @@ def get_info():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract raw video dictionary without restrictive matching
             info = ydl.extract_info(clean_video_url, download=False)
             
             if not info:
                 return jsonify({"success": False, "error": "Could not extract video data"}), 404
 
-            # If playlist, pick first item
             if 'entries' in info:
                 info = info['entries'][0]
 
             formats = info.get('formats', [])
 
-            # Filter valid playable HTTP streams (drop manifests and thumbnails)
+            # Filter out images and m3u8 playlist manifests only
             usable_streams = [
                 f for f in formats
                 if f.get('url')
                 and not str(f.get('format_id', '')).startswith('sb')
                 and str(f.get('ext', '')).lower() not in ['mhtml', 'jpg', 'webp', 'png']
-                and 'manifest.googlevideo.com' not in str(f.get('url', ''))
                 and not str(f.get('url', '')).endswith('.m3u8')
+                and 'm3u8' not in str(f.get('protocol', '')).lower()
             ]
 
             if not usable_streams:
-                return jsonify({"success": False, "error": "No direct media streams found for this video."}), 404
+                return jsonify({"success": False, "error": "No playable streams found"}), 404
 
             chosen = None
             ext = "mp4"
 
             if req_format == 'mp3':
-                # 1. Pure audio selection (highest bitrate)
                 audio_streams = [
                     f for f in usable_streams 
                     if f.get('acodec') and f.get('acodec') != 'none' 
@@ -107,7 +103,6 @@ def get_info():
                 chosen = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
                 ext = "m4a"
             else:
-                # 2. Video selection: Prefer combined (Video + Audio) progressive streams first
                 combined = [
                     f for f in usable_streams 
                     if f.get('vcodec') and f.get('vcodec') != 'none' 
@@ -116,16 +111,14 @@ def get_info():
                 if combined:
                     chosen = max(combined, key=lambda f: f.get('height') or 0)
                 else:
-                    # Fallback to best available video
                     videos = [f for f in usable_streams if f.get('vcodec') and f.get('vcodec') != 'none']
                     chosen = max(videos, key=lambda f: f.get('height') or f.get('tbr') or 0) if videos else usable_streams[-1]
 
                 ext = chosen.get('ext', 'mp4')
 
             if not chosen or not chosen.get('url'):
-                return jsonify({"success": False, "error": "Playable stream link unavailable"}), 404
+                return jsonify({"success": False, "error": "Playable stream unavailable"}), 404
 
-            # Accurate size calculation
             filesize = chosen.get('filesize') or chosen.get('filesize_approx') or 0
             duration = info.get('duration', 0)
 
