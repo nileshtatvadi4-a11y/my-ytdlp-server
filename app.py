@@ -1,7 +1,6 @@
 import os
 import sys
 import subprocess
-import tempfile
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 import yt_dlp
@@ -18,7 +17,7 @@ def home():
         "engine_version": yt_dlp.version.__version__
     })
 
-# 1. Media Info Endpoint with VR/TV Bypass
+# 1. Media Info Endpoint (Using Native Android Client - No Cookies Needed)
 @app.route('/info', methods=['GET'])
 def get_info():
     video_url = request.args.get('url')
@@ -27,84 +26,73 @@ def get_info():
     if not video_url:
         return jsonify({"success": False, "error": "Missing URL parameter"}), 400
 
-    # Cookie support via Render Environment Variable (if added in the future)
-    cookie_file = None
-    cookies_env = os.environ.get('YOUTUBE_COOKIES')
-    if cookies_env:
-        try:
-            temp_cookie = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            temp_cookie.write(cookies_env)
-            temp_cookie.close()
-            cookie_file = temp_cookie.name
-        except Exception:
-            pass
-
-    # Android VR & TV clients completely bypass datacenter IP restrictions
+    # Spoof Android App - Bypasses Datacenter IP block without login/cookies
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'nocheckcertificate': True,
-        'format': 'all',  # Accepts all streams without throwing format selector exceptions
         'extractor_args': {
             'youtube': {
-                'player_client': ['android_vr', 'tv_embedded', 'tv', 'web_embedded']
+                'player_client': ['android']
             }
         }
     }
-
-    if cookie_file:
-        ydl_opts['cookiefile'] = cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             formats = info.get('formats', [])
 
-            if not formats:
-                return jsonify({
-                    "success": False, 
-                    "error": "No streams found. YouTube blocked this specific request."
-                }), 404
+            # Filter out storyboard, preview images, and mhtml
+            media_formats = [
+                f for f in formats 
+                if f.get('url') 
+                and not str(f.get('format_id', '')).startswith('sb')
+                and f.get('ext') not in ['mhtml', 'jpg', 'webp', 'png']
+            ]
 
-            chosen_format = None
+            if not media_formats:
+                return jsonify({"success": False, "error": "No media streams found"}), 404
+
+            chosen = None
             ext = "mp4"
 
             if req_format == 'mp3':
-                # Filter for direct audio streams
+                # Pick audio-only stream with highest bitrate
                 audio_streams = [
-                    f for f in formats 
-                    if f.get('url') and f.get('acodec') != 'none' and f.get('vcodec') == 'none'
+                    f for f in media_formats 
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none'
                 ]
                 if not audio_streams:
-                    audio_streams = [f for f in formats if f.get('url') and f.get('acodec') != 'none']
+                    audio_streams = [f for f in media_formats if f.get('acodec') != 'none']
                 
-                if audio_streams:
-                    chosen_format = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
+                chosen = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
                 ext = "m4a"
             else:
-                # Filter for combined streams (Both Video + Audio)
-                progressive_streams = [
-                    f for f in formats 
-                    if f.get('url') and f.get('vcodec') != 'none' and f.get('acodec') != 'none'
+                # First priority: Progressive stream (Video + Audio combined in MP4)
+                progressive = [
+                    f for f in media_formats 
+                    if f.get('vcodec') != 'none' and f.get('acodec') != 'none'
                 ]
-                if progressive_streams:
-                    chosen_format = max(progressive_streams, key=lambda f: f.get('height') or 0)
+                if progressive:
+                    chosen = max(progressive, key=lambda f: f.get('height') or 0)
                 else:
-                    # Fallback to the highest quality video stream
-                    valid_streams = [f for f in formats if f.get('url') and f.get('vcodec') != 'none']
-                    chosen_format = max(valid_streams, key=lambda f: f.get('height') or f.get('tbr') or 0) if valid_streams else formats[-1]
-                ext = chosen_format.get('ext', 'mp4') if chosen_format else "mp4"
+                    # Fallback to any valid video stream
+                    video_only = [f for f in media_formats if f.get('vcodec') != 'none']
+                    chosen = max(video_only, key=lambda f: f.get('height') or f.get('tbr') or 0) if video_only else media_formats[-1]
+                
+                ext = chosen.get('ext', 'mp4')
 
-            if not chosen_format or not chosen_format.get('url'):
-                return jsonify({"success": False, "error": "No playable direct stream found."}), 404
+            if not chosen or not chosen.get('url'):
+                return jsonify({"success": False, "error": "Playable stream link unavailable"}), 404
 
             # Exact file size calculation
-            filesize = chosen_format.get('filesize') or chosen_format.get('filesize_approx') or 0
+            filesize = chosen.get('filesize') or chosen.get('filesize_approx') or 0
             duration = info.get('duration', 0)
             
             if filesize == 0 and duration:
-                tbr = chosen_format.get('tbr') or chosen_format.get('abr') or chosen_format.get('vbr') or 0
+                tbr = chosen.get('tbr') or chosen.get('abr') or chosen.get('vbr') or 0
                 if tbr:
                     filesize = int((tbr * 1024 * duration) / 8)
 
@@ -114,19 +102,13 @@ def get_info():
                 "duration": duration,
                 "filesize_bytes": filesize,
                 "filesize_mb": round(filesize / (1024 * 1024), 2) if filesize > 0 else 0,
-                "stream_url": chosen_format.get('url'),
-                "resolution": f"{chosen_format.get('height')}p" if chosen_format.get('height') else "Audio",
+                "stream_url": chosen.get('url'),
+                "resolution": f"{chosen.get('height')}p" if chosen.get('height') else "Audio",
                 "ext": ext
             })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        if cookie_file and os.path.exists(cookie_file):
-            try:
-                os.remove(cookie_file)
-            except Exception:
-                pass
 
 # 2. Proxy Streamer with Header Passthrough
 @app.route('/stream', methods=['GET'])
@@ -136,7 +118,7 @@ def stream_media():
         return "Missing stream URL", 400
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"
     }
     
     try:
