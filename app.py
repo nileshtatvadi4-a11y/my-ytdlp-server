@@ -38,13 +38,12 @@ def home():
         "cookies_loaded": bool(cookie_file)
     })
 
-# 1. Media Info Endpoint with Clean URLs & Direct MP4 Streams
+# 1. Media Info Endpoint (Bypasses 'The page needs to be reloaded' via mweb)
 @app.route('/info', methods=['GET'])
 def get_info():
     raw_url = request.args.get('url', '')
     req_format = request.args.get('format', 'mp4')
 
-    # Smart Regex: Extracts pure URL even if text or newlines surround it
     url_match = re.search(r'https?://[^\s"\']+', raw_url)
     if not url_match:
         return jsonify({"success": False, "error": "Invalid YouTube URL"}), 400
@@ -52,11 +51,17 @@ def get_info():
     clean_video_url = url_match.group(0).strip()
     cookie_file = ensure_cookie_file()
 
+    # Using mweb & ios clients prevents the desktop 'page needs to be reloaded' bug
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'nocheckcertificate': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['mweb', 'ios', 'web']
+            }
+        }
     }
 
     if cookie_file:
@@ -84,7 +89,7 @@ def get_info():
             ext = "mp4"
 
             if req_format == 'mp3':
-                # Pure audio streams
+                # Select best audio stream
                 audio_streams = [
                     f for f in direct_streams 
                     if f.get('acodec') and f.get('acodec') != 'none' 
@@ -96,22 +101,24 @@ def get_info():
                 chosen = max(audio_streams, key=lambda f: f.get('abr') or f.get('tbr') or 0)
                 ext = "m4a"
             else:
-                # Progressive video streams (Video + Audio combined in MP4)
+                # Prioritize progressive video (Combined Video + Audio in MP4)
                 progressive = [
                     f for f in direct_streams 
                     if f.get('vcodec') and f.get('vcodec') != 'none' 
                     and f.get('acodec') and f.get('acodec') != 'none'
                 ]
                 if progressive:
-                    # Pick 720p if available, otherwise 360p
                     chosen = max(progressive, key=lambda f: f.get('height') or 0)
                 else:
-                    chosen = direct_streams[-1]
+                    video_streams = [f for f in direct_streams if f.get('vcodec') and f.get('vcodec') != 'none']
+                    chosen = max(video_streams, key=lambda f: f.get('height') or f.get('tbr') or 0) if video_streams else direct_streams[-1]
+                
                 ext = chosen.get('ext', 'mp4')
 
             if not chosen or not chosen.get('url'):
                 return jsonify({"success": False, "error": "Playable direct link unavailable"}), 404
 
+            # Accurate file size calculation
             filesize = chosen.get('filesize') or chosen.get('filesize_approx') or 0
             duration = info.get('duration', 0)
 
